@@ -41,6 +41,7 @@ from . import (
     arrangement,
     cropping,
     handshake,
+    image_import,
     installer,
     layout,
     lifecycle,
@@ -2081,6 +2082,105 @@ def _light_params(spec: object, where: str, model: type[LightSpec] = LightSpec) 
         if item.y is not None:
             params["y"] = item.y
     return params
+
+
+@tool()
+def import_image(
+    path: str,
+    x: float,
+    y: float,
+    width: float,
+    height: float | None = None,
+    rotation: float = 0.0,
+    sorting: int = 0,
+    layer: int = 100,
+    block_light: bool = False,
+    snap: str = "",
+) -> dict:
+    """Place a local PNG on the map as an object, as dragging it in would.
+
+    path: absolute path to a PNG the user named; never guess one.
+    x, y: centre in woxels; width, height: unrotated size in woxels.
+    Omit height to keep the aspect ratio. The size includes transparent
+    margins. rotation is degrees. Alpha is kept.
+    The saved map holds the image, so it reopens without the file. The
+    returned id works with move, modify, duplicate, delete, undo and
+    checkpoints. The image does not join the asset library, so list_assets
+    will not find it. Reimporting changed bytes makes a new texture.
+    PNG only: at most 32 MiB, 8192 px per side and 16 million pixels.
+    For a reusable tagged library entry, use create_image_pack instead.
+    """
+    source = Path(path).expanduser()
+    if not source.is_absolute() or not source.is_file():
+        raise ValidationError("path must be an absolute path to a local PNG file")
+    if source.suffix.lower() != ".png":
+        raise ValidationError("only PNG images are supported")
+    if source.stat().st_size > image_import.MAX_BYTES:
+        raise ValidationError("PNG must not exceed 32 MiB")
+    require_finite(x, "x")
+    require_finite(y, "y")
+    require_positive(width, "width")
+    if height is not None:
+        require_positive(height, "height")
+    require_finite(rotation, "rotation")
+    require_choice(sorting, [0, 1], "sorting")
+    require_choice(layer, OBJECT_LAYERS, "layer")
+    image_import.read_png(str(source))
+    grid, snap_info = _snap_grid(snap)
+    x, y = _snap_xy(grid, x, y)
+    params: dict[str, Any] = dict(
+        path=source.resolve().as_posix(),
+        x=x,
+        y=y,
+        width=width,
+        rotation=rotation,
+        sorting=sorting,
+        layer=layer,
+        block_light=block_light,
+    )
+    if height is not None:
+        params["height"] = height
+    return _with_snap(bridge.request("import_image", **params), snap_info)
+
+
+class PackImage(BaseModel):
+    """A PNG and its searchable library name and tags."""
+
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    name: str
+    tags: list[str]
+
+
+@tool()
+def create_image_pack(
+    filename: str,
+    name: str,
+    images: list[PackImage],
+    pack_id: str = "",
+    author: str = "",
+) -> dict:
+    """Build a native, reusable .dungeondraft_pack of named, tagged PNG objects.
+
+    Writes only into Dungeondraft's configured asset folder (Settings > Assets),
+    never to an arbitrary path. filename: bare NEW .dungeondraft_pack name in
+    that folder; existing files are never overwritten. name: pack title related
+    to the map/project. Each image needs an absolute PNG path, a library name,
+    and descriptive tags (e.g. furniture, workshop, oak). PNG alpha is kept.
+    pack_id: optional eight alphanumeric characters; generated if omitted.
+
+    This creates a complete pack; it does not edit third-party archives. To
+    extend a collection, rebuild from the full image list under a new filename.
+    Prefer a new id during a live session; Dungeondraft caches loaded pack ids.
+
+    After writing, rescan packs in the Assets window (or restart Dungeondraft),
+    then prepare_map_with_packs with the returned id. This tool does not refresh
+    the editor or change the open map's included packs. search_pack_contents can
+    already list the new archive from disk. Embedded import_image objects stay
+    map-local; these pack assets become searchable library entries once included.
+    """
+    entries = [PackImage.model_validate(item).model_dump() for item in images]
+    return image_import.build_pack(filename, name, entries, pack_id, author)
 
 
 @tool()
@@ -4747,6 +4847,52 @@ def modify_object(
     if shadows is not None:
         params["shadows"] = shadows
     return _light_in_editor_units(bridge.request("modify_object", **params))
+
+
+@tool()
+def set_soft_shadow(
+    ids: list[int],
+    enabled: bool = True,
+    opacity: Annotated[float | None, Field(ge=0, le=2)] = None,
+    offset: Annotated[list[float] | None, Field(min_length=2, max_length=2)] = None,
+    color: str | None = None,
+    settings: dict[str, Any] | None = None,
+) -> dict:
+    """Add, change or remove Moulk's Soft Shadows on objects, walls and paths.
+
+    Needs the Soft Shadows mod (ping reports soft_shadows); refused without
+    it. One undo step for all ids; all are checked before any changes.
+    enabled: false removes the shadow. An element without one starts from
+    the mod's current defaults for its kind; one with a shadow keeps its other
+    settings.
+    opacity: 0-2 (above 1 darkens the blurred edge). offset: [x, y] in woxels,
+    where the shadow falls. color: '#rrggbb'.
+    settings: any other key of that element's shadow, such as blur for
+    objects, or softness and spread for walls and paths. get_element(id)
+    lists an element's soft_shadow keys once it has one; an unknown key is
+    refused. Prefer a modest offset (20-60) and opacity (0.4-0.8).
+    """
+    if not ids or len(ids) > BATCH_LIMIT:
+        raise ValidationError(f"ids must list 1 to {BATCH_LIMIT} elements")
+    for ident in ids:
+        if isinstance(ident, bool) or not isinstance(ident, int) or ident < 0:
+            raise ValidationError(f"element ids must be nonnegative integers, got {ident!r}")
+    if color is not None and not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        raise ValidationError("color must be '#rrggbb'")
+    if offset is not None:
+        require_finite(offset[0], "offset[0]")
+        require_finite(offset[1], "offset[1]")
+    params: dict[str, Any] = {"ids": ids, "enabled": enabled}
+    if opacity is not None:
+        require_finite(opacity, "opacity")
+        params["opacity"] = opacity
+    if offset is not None:
+        params["offset"] = list(offset)
+    if color is not None:
+        params["color"] = color
+    if settings:
+        params["settings"] = settings
+    return bridge.request("set_soft_shadow", **params)
 
 
 @tool()

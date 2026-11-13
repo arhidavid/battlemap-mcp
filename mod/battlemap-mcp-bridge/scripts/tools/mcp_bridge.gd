@@ -48,7 +48,7 @@ const IDLE_MS := 30000
 
 # Commands that get wrapped in a Dungeondraft undo record (see _record_and_dispatch).
 const CREATE_CMDS := [
-	"place_object", "draw_wall", "draw_path", "add_light",
+	"import_image", "place_object", "draw_wall", "draw_path", "add_light",
 	"add_portal", "add_roof", "add_text", "duplicate_object",
 ]
 const TRANSFORM_CMDS := ["move_element", "modify_object"]
@@ -117,6 +117,10 @@ const META_SERVER := "mcp_bridge_server"
 const META_PORT := "mcp_bridge_port"
 const META_OWNER := "mcp_bridge_owner"
 
+const META_TOKEN := "mcp_bridge_token"
+# Every staged image name this process has embedded; see _import_image.
+const META_EMBEDDED := "mcp_bridge_embedded"
+
 var _instance_id := 0
 var _port := PORT
 # Per-command log bracketing, off by default so normal use stays quiet.
@@ -174,6 +178,8 @@ const SAFE_DURING_SAVE := [
 	"screenshot", "export_map",
 	"get_operation",
 ]
+
+const MAP_UNCHANGED_CMDS := ["set_camera", "fit_elements", "focus_element", "save_map"]
 
 const UNSAFE_DURING_EXPORT := ["screenshot", "export_map", "preview_assets"]
 
@@ -263,7 +269,29 @@ func _config_path() -> String:
 	var base = _state_directory()
 	return base.plus_file(CONFIG_FILE) if base != "" else ""
 
+func _reuse_process_token() -> String:
+	if OS.get_name() != "Windows" or not Engine.has_meta(META_TOKEN):
+		return ""
+	var kept = Engine.get_meta(META_TOKEN)
+	if typeof(kept) != TYPE_DICTIONARY or kept.get("path") != _token_path():
+		return ""
+	var token = kept.get("token")
+	if typeof(token) != TYPE_STRING or token.length() != 64:
+		return ""
+	var f = File.new()
+	if f.open(_token_path(), File.READ) != OK:
+		return ""
+	var persisted = f.get_as_text()
+	f.close()
+	return token if persisted == token else ""
+
 func _ensure_token() -> String:
+	var reused = _reuse_process_token()
+	if reused != "":
+		print("[mcp-bridge] reusing this session's verified token")
+		return reused
+	if Engine.has_meta(META_TOKEN):
+		Engine.remove_meta(META_TOKEN)
 	var f = File.new()
 	# Replace the old inode before writing: chmod does not revoke an already
 	# open handle held by another account. Never write a secret into that inode.
@@ -307,6 +335,8 @@ func _ensure_token() -> String:
 	if persisted != token:
 		print("[mcp-bridge] FATAL: token persistence verification failed; the bridge is OFF.")
 		return ""
+	if OS.get_name() == "Windows":
+		Engine.set_meta(META_TOKEN, {"path": _token_path(), "token": token})
 	return token
 
 # Godot 3 has no file-permission API, so use the native platform tools and
@@ -852,12 +882,12 @@ func _record_and_dispatch(req : Dictionary) -> Dictionary:
 		if op != null:
 			_push_undo(op)
 		elif not (cmd in SAFE_DURING_SAVE) and not (cmd in ["undo", "redo"]) \
-				and not (cmd in CHECKPOINT_CMDS):
+				and not (cmd in CHECKPOINT_CMDS) and not (cmd in MAP_UNCHANGED_CMDS):
 			_note_unrecorded(str(cmd))
 		_checkpoint_warning(result)
 
 		if not (cmd in SAFE_DURING_SAVE) and not (cmd in ["undo", "redo"]) \
-				and not (cmd in CHECKPOINT_CMDS):
+				and not (cmd in CHECKPOINT_CMDS) and not (cmd in MAP_UNCHANGED_CMDS):
 			_discard_redo()
 
 	if typeof(result) == TYPE_DICTIONARY and result.get("ok", false) \
@@ -915,6 +945,10 @@ func _build_op(cmd, req, result, pre, terrain_before, cave_before = null,
 				"after": lvl.Terrain.CloneSplatImage(),
 				"before2": terrain_before2, "after2": _clone_splat2(lvl),
 				"slots_before": slots_before, "slots_after": _terrain_slots(lvl) }
+	elif cmd == "set_soft_shadow" and _soft_shadow_op != null:
+		var shadow_op = _soft_shadow_op
+		_soft_shadow_op = null
+		return shadow_op
 	elif cmd == "paint_material" and _material_before != null:
 		var before = _material_before
 		_material_before = null
@@ -1093,6 +1127,12 @@ func _apply_op(op, undo : bool):
 				_detach_node(op["node"], int(op["id"]))
 		"transform":
 			_apply_props(Global.World.GetNodeByID(int(op["id"])), op["old"] if undo else op["new"])
+		"soft_shadow":
+			for entry in op["entries"]:
+				var shadowed = Global.World.GetNodeByID(int(entry["id"]))
+				var shadow_module = _soft_shadows_module(str(entry["ref"]))
+				if shadowed != null and shadow_module != null:
+					_soft_shadow_apply(shadowed, shadow_module, entry["before"] if undo else entry["after"])
 		"wall_merge":
 			_apply_wall_merge(op, undo)
 		"transform_many":
@@ -2212,6 +2252,7 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 			"engine": Engine.get_version_info(), "bridge_sha256": _bridge_sha256(),
 			"bridge_root": Global.get("Root", ""), "process_id": OS.get_process_id(),
 			"bridge_instance": _instance_id, "unofficial_patch": _patch_info(),
+			"soft_shadows": _soft_shadows_info(),
 			"bridge_version": _bridge_version })
 		"get_status": return _get_status()
 		"list_asset_categories": return _list_asset_categories()
@@ -2261,6 +2302,8 @@ func _safe_dispatch(req : Dictionary) -> Dictionary:
 		"select_tool": return _select_tool(req)
 		"list_tool_controls": return _list_tool_controls(req)
 		# --- create ---
+		"import_image": return _import_image(req)
+		"set_soft_shadow": return _set_soft_shadow(req)
 		"place_object": return _place_object(req)
 		"place_objects": return _place_objects(req)
 		"merge_walls": return _merge_walls(req)
@@ -2353,6 +2396,13 @@ func _get_status() -> Dictionary:
 		"snapshot_ops": _snapshot_op_count(),
 		"snapshot_bytes": _snapshot_total_bytes(),
 		"snapshot_budget_bytes": SNAPSHOT_BUDGET_BYTES,
+		# Process-wide engine counters. Orphans are nodes outside the tree that
+		# nothing has freed; history holds detached elements there on purpose.
+		"engine_objects": {
+			"objects": int(Performance.get_monitor(Performance.OBJECT_COUNT)),
+			"nodes": int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT)),
+			"orphan_nodes": int(Performance.get_monitor(Performance.OBJECT_ORPHAN_NODE_COUNT)),
+		},
 		"saving": _save_state(),
 		"export": _operation_view(_export_job) if _export_running() else null,
 
@@ -2364,6 +2414,7 @@ func _get_status() -> Dictionary:
 		# contents; open_map waits for a changed instance rather than a changed path.
 		"bridge_instance": _instance_id,
 		"unofficial_patch": _patch_info(),
+		"soft_shadows": _soft_shadows_info(),
 		# A dialog is holding the editor's input: a popup from Dungeondraft or a
 		# mod (the Unofficial Patch shows several on its own). The bridge still
 		# answers, but the user may need to close it.
@@ -3892,6 +3943,10 @@ func _get_element(req : Dictionary) -> Dictionary:
 	var effects = _patch_node_effects(node)
 	if not effects.empty():
 		out["unofficial_patch_effects"] = effects
+	if _soft_shadows_info().loaded:
+		var shadow = _soft_shadow_saved(node)
+		if shadow != null:
+			out["soft_shadow"] = shadow
 	return _ok(out)
 
 func _list_levels() -> Dictionary:
@@ -3932,6 +3987,146 @@ func _delete_level(req : Dictionary) -> Dictionary:
 	return _ok({ "deleted_id": id, "label": label,
 		"level_count": Global.World.levels.size(),
 		"note": "not undoable through this bridge" })
+
+const IMPORT_STAGING_KEEP := 100
+const PNG_MAX_BYTES := 33554432
+const PNG_MAX_SIDE := 8192
+const PNG_MAX_PIXELS := 16000000
+
+func _import_image(req : Dictionary) -> Dictionary:
+	var bad_sort = _bad_sorting(req)
+	if bad_sort != null: return bad_sort
+	var bad_layer = _bad_layer(req)
+	if bad_layer != null: return bad_layer
+	for key in ["x", "y", "width", "rotation", "height"]:
+		if key == "height" and not req.has(key): continue
+		var value = req.get(key, 0.0)
+		if not (typeof(value) in [TYPE_INT, TYPE_REAL]) or is_nan(float(value)) or is_inf(float(value)):
+			return _err(key + " must be finite")
+		if key in ["width", "height"] and float(value) <= 0:
+			return _err(key + " must be positive")
+	var path = str(req.get("path", ""))
+	if not path.is_abs_path() or path.begins_with("res://") or path.begins_with("user://") or path.get_extension().to_lower() != "png":
+		return _err("path must be an absolute local PNG path")
+	var level = Global.World.GetCurrentLevel()
+	if level == null: return _err("no map open")
+	var object_tool = Global.Editor.Tools.get("ObjectTool")
+	if object_tool == null or not object_tool.has_method("EmbedObject"):
+		return _err("this Dungeondraft version has no native EmbedObject")
+	if not ClassDB.can_instance("HashingContext"):
+		return _err("this build cannot hash the image")
+	var f = File.new()
+	if f.open(path, File.READ) != OK: return _err("cannot read PNG")
+	var length = f.get_len()
+	if length < 24 or length > PNG_MAX_BYTES:
+		f.close()
+		return _err("PNG must be between 24 bytes and 32 MiB")
+	var bytes = f.get_buffer(length)
+	f.close()
+	# Read the size from IHDR before decoding, so an oversized image is
+	# refused before anything is allocated for it.
+	if bytes.subarray(0, 7).hex_encode() != "89504e470d0a1a0a" or bytes.subarray(12, 15).get_string_from_ascii() != "IHDR":
+		return _err("invalid PNG header")
+	var pw = 0
+	var ph = 0
+	for i in range(4):
+		pw = pw * 256 + int(bytes[16 + i])
+		ph = ph * 256 + int(bytes[20 + i])
+	if pw < 1 or ph < 1 or pw > PNG_MAX_SIDE or ph > PNG_MAX_SIDE or pw * ph > PNG_MAX_PIXELS:
+		return _err("PNG exceeds 8192 pixels per side or 16 million pixels")
+	var img = Image.new()
+	if img.load_png_from_buffer(bytes) != OK or img.is_empty(): return _err("invalid PNG image")
+	var digest = ClassDB.instance("HashingContext")
+	digest.start(HASH_SHA256)
+	digest.update(bytes)
+	var folder = _state_directory().plus_file("imported_images")
+	var directory = Directory.new()
+	if directory.make_dir_recursive(folder) != OK: return _err("cannot create import staging directory")
+	var hashed = digest.finish().hex_encode()
+
+	var held = Engine.get_meta(META_EMBEDDED) if Engine.has_meta(META_EMBEDDED) else {}
+	var stem = "%s-p%d" % [hashed, OS.get_process_id()]
+	var staged = ""
+	for n in range(1000):
+		var candidate = folder.plus_file(stem + ("" if n == 0 else "-%d" % n) + ".png")
+		if _imported_here.has(candidate) or not held.has(candidate):
+			staged = candidate
+			break
+	if staged == "": return _err("no free name to stage the PNG under; restart Dungeondraft")
+	var staging_error = _stage_png(staged, bytes)
+	if staging_error != "": return _err(staging_error)
+	var prop = _embed_png(level, object_tool, staged)
+	if prop == null: return _err("native image import created no object")
+	if not str(prop.Texture.resource_path).begins_with("embedded://"):
+		level.Objects.RemoveFromSearchTable(prop)
+		prop.queue_free()
+		return _err("Dungeondraft could not name the imported texture, so the map would not save its image; no object was imported")
+	_imported_here[staged] = true
+	held[staged] = true
+	Engine.set_meta(META_EMBEDDED, held)
+	_mark_saveable(prop)
+	level.Objects.RemoveFromSearchTable(prop)
+	prop.z_index = int(req.get("layer", DEFAULT_OBJECT_LAYER))
+	var under = int(req.get("sorting", 0)) == 1
+	if under: level.Objects.move_child(prop, 0)
+	level.Objects.AddToSearchTable(prop, under)
+	prop.position = Vector2(float(req.get("x", 0)), float(req.get("y", 0)))
+	var width = float(req.get("width", 256))
+	var height = float(req.get("height", width * ph / pw))
+	prop.scale = Vector2(width / pw, height / ph)
+	prop.rotation = deg2rad(float(req.get("rotation", 0)))
+	_apply_block_light(prop, bool(req.get("block_light", false)))
+	_prune_import_staging(folder, staged)
+	return _ok({ "id": _id(prop), "position": _vec(prop.position), "layer": prop.z_index,
+		"size": [width, height], "texture_size": [pw, ph], "embedded": true,
+		"asset": prop.Texture.resource_path })
+
+# Staged paths this bridge instance has imported. The bridge is loaded again
+# for every map, so this is "imported into the map that is open now".
+var _imported_here := {}
+
+func _stage_png(path : String, bytes : PoolByteArray) -> String:
+	var f = File.new()
+	if f.open(path, File.WRITE) != OK: return "cannot stage PNG"
+	f.store_buffer(bytes)
+	f.flush()
+	var write_error = f.get_error()
+	f.close()
+	return "" if write_error == OK else "could not finish staging PNG; no object was imported"
+
+# The object EmbedObject added, found by what was not there before.
+func _embed_png(level, object_tool, staged : String):
+	var before = {}
+	for child in level.Objects.get_children():
+		before[child.get_instance_id()] = true
+	object_tool.EmbedObject(staged)
+	for child in level.Objects.get_children():
+		if not before.has(child.get_instance_id()): return child
+	return null
+
+func _prune_import_staging(folder : String, keep : String) -> void:
+	var directory = Directory.new()
+	if directory.open(folder) != OK: return
+	var paths = []
+	var times = []
+	var f = File.new()
+	directory.list_dir_begin(true, true)
+	var name = directory.get_next()
+	while name != "":
+		var full = folder.plus_file(name)
+		if not directory.current_is_dir() and name.get_extension() == "png" and full != keep:
+			paths.append(full)
+			times.append(f.get_modified_time(full))
+		name = directory.get_next()
+	directory.list_dir_end()
+
+	while paths.size() >= IMPORT_STAGING_KEEP:
+		var oldest = 0
+		for i in range(1, times.size()):
+			if times[i] < times[oldest]: oldest = i
+		directory.remove(paths[oldest])
+		paths.remove(oldest)
+		times.remove(oldest)
 
 func _place_object(req : Dictionary) -> Dictionary:
 	var light_spec = req.get("light", null)
@@ -5575,6 +5770,7 @@ func _duplicate_object(req : Dictionary) -> Dictionary:
 		prop.set("HasShadow", src_shadow)
 	var copied = ["scale", "rotation", "modulate", "shadow"]
 	copied.append_array(_patch_copy_node_data(src, prop))
+	copied.append_array(_soft_shadows_copy_node_data(src, prop))
 	return _ok({ "id": _id(prop), "position": _vec(prop.position),
 		"copied": copied,
 		"note": "colour is baked at placement and cannot be copied" })
@@ -5995,6 +6191,22 @@ func _operation_view(job : Dictionary) -> Dictionary:
 			"map has unsaved work.") % [EXPORT_OVERDUE_MS / 1000]
 	return view
 
+const EDITOR_ONLY_OVERLAYS := ["SketchLayerRoot"]
+
+func _hide_editor_overlays() -> Array:
+	var hidden := []
+	if Global.World == null:
+		return hidden
+	for child in Global.World.get_children():
+		if not (child is CanvasItem) or not child.visible:
+			continue
+		for name in EDITOR_ONLY_OVERLAYS:
+			if str(child.name).find(name) != -1:
+				child.visible = false
+				hidden.append(child)
+				break
+	return hidden
+
 func _settle_export(state : String, error : String) -> void:
 	var job = _export_job
 	# Give back the quality the user's Export window chose. The unset 0 is not
@@ -6005,6 +6217,10 @@ func _settle_export(state : String, error : String) -> void:
 	var grid_mesh = Global.World.get("GridMesh") if Global.World != null else null
 	if job.get("grid_before") != null and grid_mesh != null:
 		grid_mesh.visible = bool(job["grid_before"])
+	for overlay in job.get("overlays_hidden", []):
+		if is_instance_valid(overlay):
+			overlay.visible = true
+	job["overlays_hidden"] = []
 	job["state"] = state
 	job["error"] = error
 	job["finished_ms"] = OS.get_ticks_msec()
@@ -6095,13 +6311,15 @@ func _export_map(req : Dictionary) -> Dictionary:
 		Global.Exporter.set_Quality(quality)
 	if grid_before != null:
 		Global.World.get("GridMesh").visible = bool(req["grid"])
+	var overlays_hidden = _hide_editor_overlays()
 	_export_job = { "operation_id": "export-%d-%d" % [OS.get_unix_time(), _operation_serial],
 		"kind": "export", "state": "rendering", "path": path, "format": fmt,
 		"ppi": ppi, "pixels": pixels, "chunks_rendered": 0, "seen": {},
 		"camera_before": _camera_key(), "started_ms": OS.get_ticks_msec(),
 		"last_move_ms": -1, "finished_ms": -1, "error": "", "overdue": false,
 		"quality": quality, "quality_before": quality_before,
-		"grid": req.get("grid"), "grid_before": grid_before }
+		"grid": req.get("grid"), "grid_before": grid_before,
+		"overlays_hidden": overlays_hidden }
 	Global.Exporter.Start(mode, ppi, path)
 	return _ok(_operation_view(_export_job))
 
@@ -6847,6 +7065,10 @@ func _connect_signals() -> void:
 	_connect_one(Global.Editor, "OnSaveBegin", "_on_save_begin")
 	_connect_one(Global.Editor, "OnSaveEnd", "_on_save_end")
 	_connect_one(Global.World, "OnAssignNode", "_on_assign_node")
+	_connect_one(Global.World, "tree_exiting", "_on_world_exiting")
+
+func _on_world_exiting() -> void:
+	_forget_history()
 
 func _on_save_begin(path, is_backing_up) -> void:
 	# A save that begins while another never ended means the earlier one died.
@@ -7212,6 +7434,198 @@ func _patch_info() -> Dictionary:
 	var parts = version.split(".")
 	var minor = "%s.%s" % [parts[0], parts[1]] if parts.size() >= 2 else ""
 	return { "loaded": true, "version": version, "verified": minor in PATCH_VERIFIED }
+
+const SOFT_SHADOWS_ID := "Moulk.SoftShadows"
+const SOFT_SHADOWS_VERIFIED := ["1.7"]
+
+func _soft_shadows_info() -> Dictionary:
+	var version = null
+	if Engine.has_meta("_moulk_upd_registry"):
+		var registry = Engine.get_meta("_moulk_upd_registry")
+		if typeof(registry) == TYPE_DICTIONARY and registry.has(SOFT_SHADOWS_ID) \
+				and typeof(registry[SOFT_SHADOWS_ID]) == TYPE_DICTIONARY:
+			version = str(registry[SOFT_SHADOWS_ID].get("local", ""))
+	if version == null and Engine.has_meta("dropshadow_objects_singleton"):
+		version = ""
+	if version == null:
+		return { "loaded": false }
+	var parts = version.split(".")
+	var minor = "%s.%s" % [parts[0], parts[1]] if parts.size() >= 2 else ""
+	return { "loaded": true, "version": version, "verified": minor in SOFT_SHADOWS_VERIFIED }
+
+func _soft_shadows_module(ref : String):
+	var refs = Global.ModMapData.get("_dropshadow_refs")
+	if typeof(refs) != TYPE_DICTIONARY or not refs.has(ref):
+		return null
+	var module = refs[ref]
+	if typeof(module) != TYPE_OBJECT or not is_instance_valid(module):
+		return null
+	return module
+
+func _soft_shadows_copy_node_data(src, dst) -> Array:
+	var copied := []
+	var info = _soft_shadows_info()
+	if not info.loaded or not info.verified:
+		return copied
+	if dst == null or not is_instance_valid(dst) or not src.has_meta("node_id"):
+		return copied
+	_id(dst)
+	if not dst.has_meta("node_id"):
+		return copied
+	var from = str(src.get_meta("node_id"))
+	for row in [["objects", "DropShadow", "soft shadow"], ["overlay_objects", "OverlayShadow", "soft shadow overlay"]]:
+		var store = Global.ModMapData.get(row[1])
+		if typeof(store) != TYPE_DICTIONARY or not store.has(from) \
+				or typeof(store[from]) != TYPE_DICTIONARY:
+			continue
+		var module = _soft_shadows_module(row[0])
+		if module == null:
+			continue
+		var cfg = store[from].duplicate(true)
+		if row[0] == "objects":
+			if not module.has_method("save_shadow_data") or not module.has_method("_deferred_create_shadow"):
+				continue
+			if cfg.has("shadow_color") and typeof(cfg["shadow_color"]) == TYPE_STRING:
+				cfg["shadow_color"] = Color(cfg["shadow_color"])
+			module.save_shadow_data(dst, cfg)
+			if cfg.get("enabled", false):
+				module._deferred_create_shadow(dst, cfg)
+		else:
+			if not module.has_method("_apply_clone_config"):
+				continue
+			module._apply_clone_config(dst, cfg)
+		copied.append(row[2])
+	return copied
+
+# set_soft_shadow: SelectTool's selectable type -> the Soft Shadows module that
+# draws that kind's shadow. Every kind keeps its config in ModMapData's
+# "DropShadow", and every module has the same create/remove/save trio.
+const SOFT_SHADOW_REFS := { 4: "objects", 1: "walls", 5: "paths" }
+const SOFT_SHADOW_MAX_IDS := 100
+var _soft_shadow_op = null
+
+func _soft_shadow_saved(node):
+	var store = Global.ModMapData.get("DropShadow")
+	if not node.has_meta("node_id") or typeof(store) != TYPE_DICTIONARY:
+		return null
+	var key = str(node.get_meta("node_id"))
+	if not store.has(key) or typeof(store[key]) != TYPE_DICTIONARY:
+		return null
+	return store[key].duplicate(true)
+
+# The config as the map file holds it: colour as an html string.
+func _soft_shadow_saved_form(cfg : Dictionary) -> Dictionary:
+	var out = cfg.duplicate(true)
+	if out.has("shadow_color") and typeof(out["shadow_color"]) == TYPE_COLOR:
+		out["shadow_color"] = out["shadow_color"].to_html(true)
+	return out
+
+# Put one element's shadow into a saved-form config, or remove it (null), the
+# way the mod's own Apply does: remove, create when enabled, save.
+func _soft_shadow_apply(node, module, entry) -> void:
+	module.remove_shadow(node)
+	if entry == null:
+		var store = Global.ModMapData.get("DropShadow")
+		if typeof(store) == TYPE_DICTIONARY and node.has_meta("node_id"):
+			store.erase(str(node.get_meta("node_id")))
+		return
+	var live = entry.duplicate(true)
+	if live.has("shadow_color") and typeof(live["shadow_color"]) == TYPE_STRING:
+		live["shadow_color"] = Color(live["shadow_color"])
+	if live.get("enabled", false):
+		module.create_shadow(node, live)
+	module.save_shadow_data(node, live)
+
+func _set_soft_shadow(req : Dictionary) -> Dictionary:
+	_soft_shadow_op = null
+	var info = _soft_shadows_info()
+	if not info.loaded:
+		return _err("Soft Shadows is not loaded in this Dungeondraft")
+	if not info.verified:
+		return _err("Soft Shadows %s has not been checked with this bridge; only %s are driven" % [info.version, str(SOFT_SHADOWS_VERIFIED)])
+	var bad_colour = _bad_color(req, ["color"])
+	if bad_colour != null: return bad_colour
+	var ids = req.get("ids", [])
+	if typeof(ids) != TYPE_ARRAY or ids.empty() or ids.size() > SOFT_SHADOW_MAX_IDS:
+		return _err("'ids' must list 1 to %d element ids" % SOFT_SHADOW_MAX_IDS)
+	var settings = req.get("settings", {})
+	if typeof(settings) != TYPE_DICTIONARY:
+		return _err("'settings' must be an object of shadow keys")
+	if req.has("opacity"):
+		var o = req["opacity"]
+		if not (typeof(o) in [TYPE_INT, TYPE_REAL]) or is_nan(float(o)) or float(o) < 0.0 or float(o) > 2.0:
+			return _err("'opacity' must be a number from 0 to 2")
+	if req.has("offset"):
+		var off = req["offset"]
+		if typeof(off) != TYPE_ARRAY or off.size() != 2 \
+				or not (typeof(off[0]) in [TYPE_INT, TYPE_REAL]) or not (typeof(off[1]) in [TYPE_INT, TYPE_REAL]) \
+				or is_nan(float(off[0])) or is_nan(float(off[1])) or is_inf(float(off[0])) or is_inf(float(off[1])):
+			return _err("'offset' must be [x, y] in woxels")
+	var stool = Global.Editor.Tools["SelectTool"]
+	var plan := []
+	# Validate every element before changing any, so a bad id changes nothing.
+	for raw in ids:
+		var node = Global.World.GetNodeByID(int(raw))
+		if node == null:
+			return _err("no element with id %s; nothing was changed" % str(raw))
+		var t = stool.GetSelectableType(node)
+		if not SOFT_SHADOW_REFS.has(t):
+			return _err("element %s is a %s; soft shadows are set on objects, walls and paths. Nothing was changed" % [str(raw), KIND_NAMES.get(t, "unknown")])
+		var ref = SOFT_SHADOW_REFS[t]
+		var module = _soft_shadows_module(ref)
+		if module == null or not module.has_method("create_shadow") \
+				or not module.has_method("remove_shadow") or not module.has_method("save_shadow_data"):
+			return _err("Soft Shadows' %s module is not available; nothing was changed" % ref)
+		_id(node)
+		var before = _soft_shadow_saved(node)
+		var base = before
+		if base == null:
+			var defaults = module.get("DEFAULT_SHADOW_CONFIG")
+			if typeof(defaults) != TYPE_DICTIONARY:
+				return _err("Soft Shadows has no default %s shadow to start from; nothing was changed" % ref)
+			base = _soft_shadow_saved_form(defaults)
+		var after = base.duplicate(true)
+		for key in settings.keys():
+			var k = str(key)
+			if k in ["enabled", "shadow_color"]:
+				return _err("set '%s' with its own parameter, not in settings" % k)
+			if not base.has(k):
+				return _err("'%s' is not a shadow setting for %s; get_element lists them. Nothing was changed" % [k, ref])
+			var value = settings[key]
+			var want = typeof(base[k])
+			var number = typeof(value) in [TYPE_INT, TYPE_REAL]
+			if want in [TYPE_INT, TYPE_REAL]:
+				if not number or is_nan(float(value)) or is_inf(float(value)):
+					return _err("'%s' must be a number; nothing was changed" % k)
+				after[k] = float(value) if want == TYPE_REAL else int(value)
+			elif typeof(value) != want:
+				return _err("'%s' must be the same type as its current value (%s); nothing was changed" % [k, str(base[k])])
+			else:
+				after[k] = value
+		if req.has("enabled"):
+			after["enabled"] = bool(req["enabled"])
+		if req.has("opacity"):
+			after["opacity"] = float(req["opacity"])
+		if req.has("offset"):
+			var off = req["offset"]
+			after["offset_x"] = float(off[0])
+			after["offset_y"] = float(off[1])
+		if _color_requested(req, "color"):
+			var colour = _color(req["color"], Color(0, 0, 0, 1))
+			colour.a = 1.0
+			after["shadow_color"] = colour.to_html(true)
+		plan.append({ "node": node, "module": module, "ref": ref, "before": before, "after": after })
+	var entries := []
+	for step in plan:
+		_soft_shadow_apply(step["node"], step["module"], step["after"])
+		entries.append({ "id": _id(step["node"]), "ref": step["ref"],
+			"before": step["before"], "after": step["after"] })
+	_soft_shadow_op = { "kind": "soft_shadow", "entries": entries }
+	var first = entries[0]["after"]
+	return _ok({ "updated": entries.size(), "ids": ids,
+		"enabled": first.get("enabled", false), "opacity": first.get("opacity"),
+		"offset": [first.get("offset_x"), first.get("offset_y")],
+		"color": first.get("shadow_color") })
 
 func _patch_loaded() -> bool:
 	return _patch_info().loaded
